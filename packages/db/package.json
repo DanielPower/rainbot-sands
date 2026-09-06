@@ -7,11 +7,12 @@
   },
   "scripts": {
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "drizzle-kit migrate",
+    "db:migrate": "drizzle-kit migrate && node src/migrate-pg-boss.ts",
     "test": "vitest run"
   },
   "dependencies": {
     "drizzle-orm": "latest",
+    "pg-boss": "^12.30.0",
     "postgres": "latest"
   },
   "devDependencies": {

@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, isNull, lt, notInArray, or, sql } from "drizzle-orm";
+import { and, eq, inArray, notInArray, or } from "drizzle-orm";
 import type { SessionArtifactRef, SessionArtifactWrite } from "./artifacts.ts";
 import { db } from "./client.ts";
 import type { NotificationStatus, ProcessingRunKind, ProcessingRunStatus } from "./domain.ts";
 import { processingRuns, sessionArtifacts, sessionSegments, sessions } from "./schema.ts";
+import { JOB_QUEUES, enqueueJob, startJobQueue } from "./jobs.ts";
+import { advanceTranscriptionBarrier } from "./transcription.ts";
 
 function toArtifactRef(
   artifact: typeof sessionArtifacts.$inferSelect | undefined,
@@ -35,7 +37,6 @@ export interface ProcessingRunData {
   notificationChannelId: string | null;
   notificationStatus: NotificationStatus | null;
   startedAt: Date;
-  attemptCount: number;
 }
 
 export async function getProcessingRun(runId: string): Promise<ProcessingRunData | null> {
@@ -52,7 +53,6 @@ export async function getProcessingRun(runId: string): Promise<ProcessingRunData
       notificationChannelId: processingRuns.notificationChannelId,
       notificationStatus: processingRuns.notificationStatus,
       startedAt: sessions.startedAt,
-      attemptCount: processingRuns.attemptCount,
     })
     .from(processingRuns)
     .innerJoin(sessions, eq(processingRuns.sessionId, sessions.id))
@@ -92,97 +92,7 @@ export async function getProcessingRun(runId: string): Promise<ProcessingRunData
     notificationChannelId: run.notificationChannelId,
     notificationStatus: run.notificationStatus,
     startedAt: run.startedAt,
-    attemptCount: run.attemptCount,
   };
-}
-
-const RUNNABLE_STATUSES = [
-  "transcribing",
-  "aggregating",
-  "summarizing",
-  "recapping",
-  "titling",
-  "done",
-] as const satisfies readonly ProcessingRunStatus[];
-
-export async function claimProcessingRuns(
-  workerId: string,
-  limit: number,
-  leaseMilliseconds: number,
-): Promise<string[]> {
-  return db.transaction(async (tx) => {
-    const now = new Date();
-    const candidates = await tx
-      .select({ id: processingRuns.id })
-      .from(processingRuns)
-      .where(
-        and(
-          inArray(processingRuns.status, [...RUNNABLE_STATUSES]),
-          or(
-            notInArray(processingRuns.status, ["done"]),
-            eq(processingRuns.notificationStatus, "pending"),
-          ),
-          lt(processingRuns.availableAt, new Date(now.getTime() + 1)),
-          or(isNull(processingRuns.leaseExpiresAt), lt(processingRuns.leaseExpiresAt, now)),
-        ),
-      )
-      .orderBy(asc(processingRuns.availableAt), asc(processingRuns.createdAt))
-      .limit(limit)
-      .for("update", { skipLocked: true });
-
-    if (candidates.length === 0) return [];
-    const ids = candidates.map((candidate) => candidate.id);
-    await tx
-      .update(processingRuns)
-      .set({
-        lockedBy: workerId,
-        leaseExpiresAt: new Date(now.getTime() + leaseMilliseconds),
-        attemptCount: sql`${processingRuns.attemptCount} + 1`,
-        updatedAt: now,
-      })
-      .where(inArray(processingRuns.id, ids));
-    return ids;
-  });
-}
-
-export async function renewProcessingRunLease(
-  runId: string,
-  workerId: string,
-  leaseMilliseconds: number,
-): Promise<boolean> {
-  const rows = await db
-    .update(processingRuns)
-    .set({
-      leaseExpiresAt: new Date(Date.now() + leaseMilliseconds),
-      updatedAt: new Date(),
-    })
-    .where(
-      and(
-        eq(processingRuns.id, runId),
-        eq(processingRuns.lockedBy, workerId),
-        notInArray(processingRuns.status, ["done", "failed"]),
-      ),
-    )
-    .returning({ id: processingRuns.id });
-  return rows.length > 0;
-}
-
-export async function releaseProcessingRun(
-  runId: string,
-  workerId: string,
-  retryDelayMilliseconds = 0,
-  error?: string,
-): Promise<void> {
-  await db
-    .update(processingRuns)
-    .set({
-      lockedBy: null,
-      leaseExpiresAt: null,
-      availableAt: new Date(Date.now() + retryDelayMilliseconds),
-      ...(error ? { error } : {}),
-      updatedAt: new Date(),
-    })
-    .where(and(eq(processingRuns.id, runId), eq(processingRuns.lockedBy, workerId)));
 }
 
 export async function storeAggregatedTranscript(
@@ -219,10 +129,6 @@ export async function storeAggregatedTranscript(
       .where(and(eq(processingRuns.id, runId), eq(processingRuns.status, "aggregating")))
       .returning({ sessionId: processingRuns.sessionId });
     if (!updated[0]) return false;
-    await tx
-      .update(sessionSegments)
-      .set({ transcript: null, updatedAt: new Date() })
-      .where(eq(sessionSegments.transcriptionRunId, runId));
     await tx
       .update(sessions)
       .set({ status: "summarizing" })
@@ -376,6 +282,7 @@ export async function failProcessingRun(runId: string, message: string): Promise
 }
 
 export async function startInferenceRegeneration(sessionId: string): Promise<string> {
+  await startJobQueue();
   const runId = randomUUID();
   await db.transaction(async (tx) => {
     const [session] = await tx
@@ -409,8 +316,80 @@ export async function startInferenceRegeneration(sessionId: string): Promise<str
       .update(sessions)
       .set({ activeRunId: runId, status: "summarizing" })
       .where(eq(sessions.id, sessionId));
+    await enqueueJob(tx, JOB_QUEUES.advanceProcessingRun, { runId }, runId);
   });
   return runId;
+}
+
+export async function reconcilePendingJobs(): Promise<void> {
+  await startJobQueue();
+  await db.transaction(async (tx) => {
+    const segments = await tx
+      .select({
+        sessionId: sessionSegments.sessionId,
+        runId: sessionSegments.transcriptionRunId,
+        segmentId: sessionSegments.segmentId,
+        jobId: sessionSegments.transcriptionJobId,
+      })
+      .from(sessionSegments)
+      .innerJoin(processingRuns, eq(sessionSegments.transcriptionRunId, processingRuns.id))
+      .innerJoin(sessions, eq(processingRuns.sessionId, sessions.id))
+      .where(
+        and(
+          eq(sessionSegments.audioStatus, "ready"),
+          inArray(sessionSegments.transcriptionStatus, ["pending", "processing"]),
+          inArray(processingRuns.status, ["recording", "transcribing"]),
+          eq(sessions.activeRunId, processingRuns.id),
+        ),
+      );
+
+    for (const segment of segments) {
+      if (!segment.runId) continue;
+      const jobId = segment.jobId ?? randomUUID();
+      if (!segment.jobId) {
+        await tx
+          .update(sessionSegments)
+          .set({ transcriptionJobId: jobId, updatedAt: new Date() })
+          .where(
+            and(
+              eq(sessionSegments.sessionId, segment.sessionId),
+              eq(sessionSegments.segmentId, segment.segmentId),
+              eq(sessionSegments.transcriptionRunId, segment.runId),
+            ),
+          );
+      }
+      await enqueueJob(
+        tx,
+        JOB_QUEUES.transcribeSegment,
+        {
+          jobId,
+          sessionId: segment.sessionId,
+          runId: segment.runId,
+          segmentId: segment.segmentId,
+        },
+        jobId,
+      );
+    }
+
+    const runnableRuns = await tx
+      .select({ id: processingRuns.id })
+      .from(processingRuns)
+      .where(
+        or(
+          inArray(processingRuns.status, ["aggregating", "summarizing", "recapping", "titling"]),
+          and(eq(processingRuns.status, "done"), eq(processingRuns.notificationStatus, "pending")),
+        ),
+      );
+    for (const run of runnableRuns) {
+      await enqueueJob(tx, JOB_QUEUES.advanceProcessingRun, { runId: run.id }, run.id);
+    }
+
+    const transcribingRuns = await tx
+      .select({ id: processingRuns.id })
+      .from(processingRuns)
+      .where(eq(processingRuns.status, "transcribing"));
+    for (const run of transcribingRuns) await advanceTranscriptionBarrier(tx, run.id);
+  });
 }
 export async function markNotificationComplete(runId: string): Promise<void> {
   await db

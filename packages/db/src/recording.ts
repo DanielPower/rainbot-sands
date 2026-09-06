@@ -7,6 +7,8 @@ import {
   type RecoverableSessionStatus,
 } from "./domain.ts";
 import { processingRuns, sessionSegments, sessions } from "./schema.ts";
+import { JOB_QUEUES, enqueueJob, startJobQueue } from "./jobs.ts";
+import { advanceTranscriptionBarrier } from "./transcription.ts";
 
 export interface AudioSegmentRef {
   segmentId: string;
@@ -134,22 +136,37 @@ export async function markSegmentReady(
   runId: string,
   segmentId: string,
 ): Promise<void> {
-  await db
-    .update(sessionSegments)
-    .set({
-      audioStatus: "ready",
-      transcriptionStatus: "pending",
-      transcript: null,
-      error: null,
-      updatedAt: new Date(),
-    })
-    .where(
-      and(
-        eq(sessionSegments.sessionId, sessionId),
-        eq(sessionSegments.segmentId, segmentId),
-        eq(sessionSegments.transcriptionRunId, runId),
-      ),
+  await startJobQueue();
+  const jobId = randomUUID();
+  await db.transaction(async (tx) => {
+    const ready = await tx
+      .update(sessionSegments)
+      .set({
+        audioStatus: "ready",
+        transcriptionStatus: "pending",
+        transcriptionJobId: jobId,
+        transcript: null,
+        transcribedAt: null,
+        error: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(sessionSegments.sessionId, sessionId),
+          eq(sessionSegments.segmentId, segmentId),
+          eq(sessionSegments.transcriptionRunId, runId),
+          eq(sessionSegments.audioStatus, "recording"),
+        ),
+      )
+      .returning({ segmentId: sessionSegments.segmentId });
+    if (!ready[0]) return;
+    await enqueueJob(
+      tx,
+      JOB_QUEUES.transcribeSegment,
+      { jobId, sessionId, runId, segmentId },
+      jobId,
     );
+  });
 }
 
 export async function markSegmentAudioFailed(
@@ -163,6 +180,7 @@ export async function markSegmentAudioFailed(
     .set({
       audioStatus: "failed",
       transcriptionStatus: "failed",
+      transcribedAt: new Date(),
       error: message,
       updatedAt: new Date(),
     })
@@ -213,6 +231,7 @@ export async function beginClosingSession(sessionId: string, runId: string): Pro
 }
 
 export async function finishClosingSession(sessionId: string, runId: string): Promise<void> {
+  await startJobQueue();
   await db.transaction(async (tx) => {
     await tx
       .update(sessions)
@@ -255,7 +274,10 @@ export async function finishClosingSession(sessionId: string, runId: string): Pr
         .update(sessions)
         .set({ status: "failed", activeRunId: null })
         .where(and(eq(sessions.id, sessionId), eq(sessions.activeRunId, runId)));
+      return;
     }
+
+    await advanceTranscriptionBarrier(tx, runId);
   });
 }
 export async function getAudioSegmentsForRecovery(sessionId: string): Promise<

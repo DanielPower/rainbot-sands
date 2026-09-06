@@ -8,6 +8,8 @@ for workspace-wide conventions.
 ## Layout
 
 - `src/routes/` — pages + `+page.server.ts` loaders and `auth/` OAuth endpoints.
+- Session transcript routes include an authenticated SSE endpoint that polls
+  completed segment checkpoints and streams snippets until processing ends.
 - `src/hooks.server.ts` — session cookie verification + theme injection.
 - `src/lib/server/` — `env.ts`, `session.ts` (HMAC cookie), `discord.ts` (OAuth).
 - `src/lib/components/`, `src/app.css`, `src/app.html`.
@@ -59,3 +61,5 @@ The web service needs `S3_BUCKET_AUDIO` for manual ingestion and
   avoid FOUC; the toggle sets the cookie client-side.
 - Summary/recap markdown is rendered with `marked` via `{@html …}` — the content
   is model-generated (not user input).
+- Live transcript delivery reads `session_segments`; it does not depend on
+  pg-boss tables or job events. Keep the queue private to producers and workers.

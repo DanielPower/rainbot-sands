@@ -1,4 +1,12 @@
 export {
+  JOB_QUEUES,
+  enqueueJob,
+  startJobQueue,
+  stopJobQueue,
+  type AdvanceProcessingRunJob,
+  type TranscribeSegmentJob,
+} from "./jobs.ts";
+export {
   SESSION_ARTIFACT_KINDS,
   type SessionArtifactKind,
   type SessionArtifactRef,
@@ -47,6 +55,7 @@ export {
   getCampaignCast,
   getCampaignDetail,
   getSessionDetail,
+  getSessionStatus,
   type CampaignMember,
   type CampaignAccess,
   type CampaignCastMember,
@@ -70,25 +79,24 @@ export {
   type RecoverableSession,
 } from "./recording.ts";
 export {
+  claimSegmentForTranscription,
   claimAggregationIfReady,
   completeSegmentTranscription,
   failSegmentTranscription,
   getAudioSegmentRefs,
   getTranscriptSegments,
-  listSegmentsForTranscription,
-  markTranscriptionProcessing,
+  listLiveTranscriptSegments,
   startTranscriptRegeneration,
+  type LiveTranscriptSnippet,
   type SegmentForTranscription,
 } from "./transcription.ts";
 export {
-  claimProcessingRuns,
   completeProcessingRun,
   failProcessingRun,
   getProcessingRun,
   markNotificationComplete,
   markNotificationFailed,
-  releaseProcessingRun,
-  renewProcessingRunLease,
+  reconcilePendingJobs,
   startInferenceRegeneration,
   storeAggregatedTranscript,
   storeRunDetailedRecord,

@@ -13,7 +13,8 @@ Drizzle ORM schema, Postgres client, and all shared queries. See the root
   `getCampaignAccess` resolves admin/member access in one database query.
 - `recording.ts` — recording lifecycle, clip registration, and crash recovery.
 - `transcription.ts` — segment transcription checkpoints and aggregation barrier.
-- `processing-runs.ts` — processing queue leases, inference state, and publication.
+- `processing-runs.ts` — inference state, publication, and queue reconciliation.
+- `jobs.ts` — lazy pg-boss lifecycle, queue definitions, and transactional sends.
 - `artifacts.ts` — shared metadata types for durable session objects.
 - `transcript.ts` — the `Transcript`/`TranscriptSegment` JSON shape stored in
   transcript artifacts, plus display and inference formatting transforms.
@@ -43,7 +44,8 @@ pnpm --filter @rainbot/db db:migrate    # applies to the DB in DATABASE_URL
   `.sql` files. Let `drizzle-kit` manage them; don't hand-edit. (If you must
   discard an _uncommitted, never-applied_ migration, delete its `.sql` +
   snapshot and revert the journal entry, then regenerate.)
-- In production, the `db-migrate` compose service runs `db:migrate` on deploy.
+- In production, the `db-migrate` compose service runs `db:migrate` on deploy;
+  this applies both Drizzle application migrations and pg-boss schema migrations.
 
 ## Data model notes
 
@@ -68,4 +70,8 @@ pnpm --filter @rainbot/db db:migrate    # applies to the DB in DATABASE_URL
   the DM). The cast legend and player management depend on these.
 - `users.is_admin` grants application-wide visibility into every campaign and
   is managed manually.
-- Processing writes use conditional transitions so expired leases and repeated work are safe.
+- A ready audio segment and its `transcribe-segment` job are committed in the
+  same transaction. Completing the last segment after session close advances
+  the run and enqueues its `advance-processing-run` job atomically.
+- Processing writes use conditional transitions so expired or redelivered
+  pg-boss jobs are safe.

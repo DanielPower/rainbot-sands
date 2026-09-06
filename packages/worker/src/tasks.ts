@@ -47,6 +47,7 @@ function audioMimeType(audioPath: string): string {
 export async function transcribeSegment(
   audioPath: string,
   ref: AudioSegmentRef,
+  signal?: AbortSignal,
 ): Promise<TranscriptSegment | null> {
   if (!existsSync(audioPath)) {
     throw new UnrecoverableTaskError(`Audio file not found for segment ${ref.segmentId}`);
@@ -70,6 +71,7 @@ export async function transcribeSegment(
   const res = await fetch(TRANSCRIPTION_URL, {
     method: "POST",
     body: form,
+    signal,
   });
 
   if (!res.ok) {

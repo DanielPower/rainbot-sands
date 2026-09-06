@@ -1,6 +1,7 @@
 import { defineConfig } from "drizzle-kit";
 import { loadEnvFile } from "node:process";
 import { fileURLToPath } from "node:url";
+import { pgConnectionString } from "./src/connection.ts";
 
 // Load the repo-root .env for local development. In Docker/CI the file is
 // absent and the variables come from the environment directly, so ignore the
@@ -18,5 +19,5 @@ export default defineConfig({
   schema: "./src/schema.ts",
   out: "./drizzle",
   dialect: "postgresql",
-  dbCredentials: { url: DATABASE_URL },
+  dbCredentials: { url: pgConnectionString(DATABASE_URL) },
 });

@@ -7,29 +7,32 @@ each `packages/*/AGENTS.md`.
 
 **rainbot-sands** is a Discord bot that records tabletop RPG sessions, transcribes
 them with whisper.cpp, and generates summaries/recaps/titles with local or cloud
-models. PostgreSQL owns the durable processing queue and state, S3-compatible
-object storage holds activation audio, and a SvelteKit web app displays results.
+models. pg-boss owns the durable queue in PostgreSQL alongside the processing
+state, S3-compatible object storage holds activation audio, and a SvelteKit web
+app displays results.
 
 ## Architecture / data flow
 
 ```
 Discord voice ──/start──▶ Postgres session + processing run
-   │  per voice activation             │
-   │  ogg/opus clip ───────────────▶ private S3-compatible object storage
-   │                                    ▼
-   └──/stop or empty channel──▶ aggregate ▶ detailed record ▶ recap ▶ title
-                                  │              │            ▼
-                                  └──── private artifact S3 + Postgres metadata
-                                                        └──▶ SvelteKit web app
+   │  per voice activation
+   │  ogg/opus clip ──▶ private S3 ──▶ pg-boss transcribe job ──▶ live snippet
+   │                                                        │
+   └──/stop or empty channel────────────────────────────────┘
+                                                            ▼
+                         aggregate ▶ detailed record ▶ recap ▶ title
+                             │              │            ▼
+                             └──── private artifact S3 + Postgres metadata
+                                                   └──▶ SvelteKit web app
 ```
 
 - The **discord** bot records audio; every activation is registered in Postgres
   before recording and uploaded after its file closes.
-- The **worker** package claims session processing runs from Postgres with
-  leases, processes activation manifests with bounded concurrency, and stores
-  transcripts/detailed records in artifact object storage.
+- The **worker** package consumes pg-boss jobs as clips become available, then
+  advances post-session aggregation and inference with bounded concurrency.
 - The **db** package is the single source of truth for the schema and all queries.
-- The **web** app is read-only over the same database.
+- The **web** app reads the same database and streams completed segment
+  transcripts to active session pages with SSE.
 
 ## Monorepo layout
 
@@ -80,13 +83,13 @@ when adding a variable. The full table is in `README.md`.
 
 `docker-compose.yml` runs everything from prebuilt GHCR images. The
 `.github/workflows/deploy.yml` matrix builds one image per package. `db-migrate`
-runs Drizzle migrations before application services start. External
+runs Drizzle and pg-boss migrations before application services start. External
 dependencies: PostgreSQL, S3-compatible object storage, whisper.cpp server, an optional
 local/cloud language model provider, and ffmpeg (in the discord image).
 
 ## Cross-cutting conventions
 
-- **Idempotency:** Worker leases can expire and work may be repeated.
-  Conditional DB transitions make every processing step safe to repeat.
+- **Idempotency:** pg-boss jobs can expire, retry, or be redelivered. Conditional
+  DB transitions make every processing step safe to repeat.
 - **Don't commit secrets.** `.env` and `media/` are gitignored.
 - **Only commit/push when asked.** If asked, branch off `main` first.

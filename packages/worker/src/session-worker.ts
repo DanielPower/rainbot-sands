@@ -1,30 +1,31 @@
-import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
-import { hostname, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  JOB_QUEUES,
   claimAggregationIfReady,
-  claimProcessingRuns,
+  claimSegmentForTranscription,
   completeProcessingRun,
   completeSegmentTranscription,
   failProcessingRun,
   failSegmentTranscription,
   getProcessingRun,
   getTranscriptSegments,
-  listSegmentsForTranscription,
   markNotificationComplete,
   markNotificationFailed,
-  markTranscriptionProcessing,
-  releaseProcessingRun,
-  renewProcessingRunLease,
+  reconcilePendingJobs,
+  startJobQueue,
+  stopJobQueue,
   storeAggregatedTranscript,
   storeRunDetailedRecord,
   storeRunRecap,
   storeRunTitle,
+  type AdvanceProcessingRunJob,
   type ProcessingRunData,
   type SessionArtifactKind,
   type SegmentForTranscription,
   type Transcript,
+  type TranscribeSegmentJob,
 } from "@rainbot/db";
 import {
   ArtifactIntegrityError,
@@ -35,17 +36,12 @@ import {
   loadDetailedRecordArtifact,
   loadTranscriptArtifact,
 } from "@rainbot/storage";
-import { postSessionLink } from "./notify.ts";
 import { UnrecoverableTaskError } from "./errors.ts";
+import { postSessionLink } from "./notify.ts";
 import { generateTitle, recap, summarize, transcribeSegment } from "./tasks.ts";
 
-const WORKER_ID = `${hostname()}:${process.pid}:${randomUUID()}`;
-const LEASE_MILLISECONDS = 5 * 60_000;
-const HEARTBEAT_MILLISECONDS = 30_000;
-const POLL_MILLISECONDS = positiveInteger("PROCESSING_POLL_MILLISECONDS", 2_000);
 const PROCESSING_CONCURRENCY = positiveInteger("PROCESSING_CONCURRENCY", 2);
 const TRANSCRIPTION_CONCURRENCY = positiveInteger("TRANSCRIPTION_CONCURRENCY", 4);
-const MAX_ATTEMPTS = positiveInteger("PROCESSING_MAX_ATTEMPTS", 3);
 
 function positiveInteger(name: string, fallback: number): number {
   const value = process.env[name];
@@ -65,10 +61,6 @@ function errorMessage(error: Error): string {
   return error.stack || error.message;
 }
 
-function wait(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
 async function noCleanup(): Promise<void> {}
 
 async function uploadSessionArtifact(
@@ -83,22 +75,6 @@ async function uploadSessionArtifact(
     artifactObjectKey(campaignId, sessionId, runId, kind, artifactContentHash(body)),
     body,
     contentType,
-  );
-}
-
-async function mapConcurrent<T>(
-  values: T[],
-  concurrency: number,
-  operation: (value: T) => Promise<void>,
-): Promise<void> {
-  let index = 0;
-  await Promise.all(
-    Array.from({ length: Math.min(concurrency, values.length) }, async () => {
-      while (index < values.length) {
-        const value = values[index++];
-        if (value !== undefined) await operation(value);
-      }
-    }),
   );
 }
 
@@ -120,54 +96,49 @@ async function materializeAudio(
   };
 }
 
-async function transcribeOne(segment: SegmentForTranscription): Promise<void> {
-  if (!(await markTranscriptionProcessing(segment.runId, segment.sessionId, segment.segmentId))) {
-    return;
+async function transcribeOne(
+  jobId: string,
+  payload: TranscribeSegmentJob,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (payload.jobId !== jobId) {
+    throw new UnrecoverableTaskError(`Transcription job id mismatch: ${jobId}`);
   }
+  const segment = await claimSegmentForTranscription(
+    jobId,
+    payload.runId,
+    payload.sessionId,
+    payload.segmentId,
+  );
+  if (!segment) return;
 
-  let lastError: Error | null = null;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    let cleanup: () => Promise<void> = noCleanup;
-    try {
-      const materialized = await materializeAudio(segment);
-      cleanup = materialized.cleanup;
-      const transcript = await transcribeSegment(materialized.audioPath, segment);
-      await completeSegmentTranscription(
+  let cleanup: () => Promise<void> = noCleanup;
+  try {
+    const materialized = await materializeAudio(segment);
+    cleanup = materialized.cleanup;
+    const transcript = await transcribeSegment(materialized.audioPath, segment, signal);
+    await completeSegmentTranscription(
+      jobId,
+      segment.runId,
+      segment.sessionId,
+      segment.segmentId,
+      transcript,
+    );
+  } catch (error) {
+    const failure = asError(error);
+    if (failure instanceof UnrecoverableTaskError) {
+      await failSegmentTranscription(
+        jobId,
         segment.runId,
         segment.sessionId,
         segment.segmentId,
-        transcript,
+        errorMessage(failure),
       );
       return;
-    } catch (error) {
-      lastError = asError(error);
-      console.error(
-        `[transcribe] segment ${segment.segmentId} failed on attempt ${attempt}/${MAX_ATTEMPTS}:`,
-        lastError,
-      );
-      if (lastError instanceof UnrecoverableTaskError || attempt === MAX_ATTEMPTS) break;
-      await wait(2_000 * 2 ** (attempt - 1));
-    } finally {
-      await cleanup();
     }
-  }
-
-  await failSegmentTranscription(
-    segment.runId,
-    segment.sessionId,
-    segment.segmentId,
-    errorMessage(lastError ?? new Error("Transcription failed")),
-  );
-}
-
-async function transcribeRun(runId: string): Promise<void> {
-  while (true) {
-    const segments = await listSegmentsForTranscription(runId);
-    if (segments.length === 0) {
-      await claimAggregationIfReady(runId);
-      return;
-    }
-    await mapConcurrent(segments, TRANSCRIPTION_CONCURRENCY, transcribeOne);
+    throw failure;
+  } finally {
+    await cleanup();
   }
 }
 
@@ -191,9 +162,7 @@ async function aggregateRun(run: ProcessingRunData): Promise<void> {
 async function readTranscript(run: ProcessingRunData): Promise<Transcript> {
   const artifact =
     run.kind === "inference" ? run.sourceTranscriptArtifact : run.generatedTranscriptArtifact;
-  if (!artifact) {
-    throw new UnrecoverableTaskError(`Run ${run.id} has no transcript artifact`);
-  }
+  if (!artifact) throw new UnrecoverableTaskError(`Run ${run.id} has no transcript artifact`);
   return loadTranscriptArtifact(artifact);
 }
 
@@ -207,7 +176,7 @@ async function readDetailedRecord(run: ProcessingRunData): Promise<string> {
 async function processCurrentStage(run: ProcessingRunData): Promise<void> {
   switch (run.status) {
     case "transcribing":
-      await transcribeRun(run.id);
+      await claimAggregationIfReady(run.id);
       return;
     case "aggregating":
       await aggregateRun(run);
@@ -251,61 +220,26 @@ async function processCurrentStage(run: ProcessingRunData): Promise<void> {
   }
 }
 
-async function processRun(runId: string): Promise<void> {
-  const heartbeat = setInterval(() => {
-    void renewProcessingRunLease(runId, WORKER_ID, LEASE_MILLISECONDS).catch((error) => {
-      console.error(`[worker] could not renew lease for ${runId}:`, error);
-    });
-  }, HEARTBEAT_MILLISECONDS);
-
+async function processRun(payload: AdvanceProcessingRunJob): Promise<void> {
   try {
     while (true) {
-      const run = await getProcessingRun(runId);
-      if (!run || run.status === "failed") break;
+      const run = await getProcessingRun(payload.runId);
+      if (!run || run.status === "failed") return;
+      if (run.status === "transcribing") {
+        await claimAggregationIfReady(run.id);
+        return;
+      }
       await processCurrentStage(run);
-      if (run.status === "done") break;
+      if (run.status === "done") return;
     }
-    await releaseProcessingRun(runId, WORKER_ID);
   } catch (error) {
     const failure = asError(error);
-    console.error(`[worker] processing run ${runId} failed:`, failure);
-    const run = await getProcessingRun(runId);
-    if (
-      failure instanceof UnrecoverableTaskError ||
-      failure instanceof ArtifactIntegrityError ||
-      (run?.attemptCount ?? 0) >= MAX_ATTEMPTS
-    ) {
-      await failProcessingRun(runId, errorMessage(failure));
-    } else {
-      await releaseProcessingRun(runId, WORKER_ID, 5_000, errorMessage(failure));
+    if (failure instanceof UnrecoverableTaskError || failure instanceof ArtifactIntegrityError) {
+      await failProcessingRun(payload.runId, errorMessage(failure));
+      return;
     }
-  } finally {
-    clearInterval(heartbeat);
+    throw failure;
   }
-}
-
-export async function runSessionWorker(signal: AbortSignal): Promise<void> {
-  console.log(`[worker] Postgres session worker ${WORKER_ID} started`);
-  const active = new Set<Promise<void>>();
-
-  while (!signal.aborted) {
-    const capacity = PROCESSING_CONCURRENCY - active.size;
-    if (capacity > 0) {
-      const runIds = await claimProcessingRuns(WORKER_ID, capacity, LEASE_MILLISECONDS);
-      for (const runId of runIds) {
-        const processing = processRun(runId).finally(() => active.delete(processing));
-        active.add(processing);
-      }
-    }
-    if (active.size === 0) {
-      await Promise.race([wait(POLL_MILLISECONDS), abortPromise(signal)]);
-    } else {
-      await Promise.race([...active, wait(POLL_MILLISECONDS), abortPromise(signal)]);
-    }
-  }
-
-  await Promise.allSettled(active);
-  console.log("[worker] Postgres session worker stopped");
 }
 
 function abortPromise(signal: AbortSignal): Promise<void> {
@@ -313,4 +247,42 @@ function abortPromise(signal: AbortSignal): Promise<void> {
   return new Promise((resolve) =>
     signal.addEventListener("abort", () => resolve(), { once: true }),
   );
+}
+
+export async function runSessionWorker(signal: AbortSignal): Promise<void> {
+  const boss = await startJobQueue({ worker: true });
+
+  await boss.work<TranscribeSegmentJob>(
+    JOB_QUEUES.transcribeSegment,
+    { localConcurrency: TRANSCRIPTION_CONCURRENCY },
+    async ([job]) => {
+      if (job) await transcribeOne(job.id, job.data, job.signal);
+    },
+  );
+  await boss.work<AdvanceProcessingRunJob>(
+    JOB_QUEUES.advanceProcessingRun,
+    { localConcurrency: PROCESSING_CONCURRENCY },
+    async ([job]) => {
+      if (job) await processRun(job.data);
+    },
+  );
+  await boss.work<TranscribeSegmentJob>(JOB_QUEUES.transcribeSegmentDead, async ([job]) => {
+    if (!job) return;
+    await failSegmentTranscription(
+      job.data.jobId,
+      job.data.runId,
+      job.data.sessionId,
+      job.data.segmentId,
+      "Transcription exhausted its retry limit",
+    );
+  });
+  await boss.work<AdvanceProcessingRunJob>(JOB_QUEUES.advanceProcessingRunDead, async ([job]) => {
+    if (job) await failProcessingRun(job.data.runId, "Processing exhausted its retry limit");
+  });
+
+  await reconcilePendingJobs();
+  console.log("[worker] pg-boss workers started");
+  await abortPromise(signal);
+  await stopJobQueue();
+  console.log("[worker] pg-boss workers stopped");
 }

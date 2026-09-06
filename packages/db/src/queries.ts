@@ -233,3 +233,12 @@ export async function getSessionDetail(sessionId: string): Promise<SessionDetail
     detailedRecordArtifact,
   };
 }
+
+export async function getSessionStatus(sessionId: string): Promise<SessionStatus | null> {
+  const [session] = await db
+    .select({ status: sessions.status })
+    .from(sessions)
+    .where(eq(sessions.id, sessionId))
+    .limit(1);
+  return session?.status ?? null;
+}

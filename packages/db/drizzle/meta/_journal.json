@@ -134,6 +134,13 @@
       "when": 1788643658618,
       "tag": "0018_tricky_richard_fisk",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1788721784320,
+      "tag": "0019_square_red_wolf",
+      "breakpoints": true
     }
   ]
 }

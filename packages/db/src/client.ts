@@ -3,6 +3,7 @@ import postgres from "postgres";
 import * as schema from "./schema.ts";
 
 type DB = PostgresJsDatabase<typeof schema>;
+export type DatabaseTransaction = Parameters<Parameters<DB["transaction"]>[0]>[0];
 
 let instance: DB | null = null;
 

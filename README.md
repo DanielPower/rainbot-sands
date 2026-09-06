@@ -2,19 +2,19 @@
 
 Discord bot that records tabletop RPG sessions, transcribes them with
 whisper.cpp, and generates detailed records and recaps with local or cloud
-language models. PostgreSQL owns the durable processing queue and pipeline
-state, while S3-compatible object storage holds activation audio and generated
-session artifacts.
+language models. pg-boss provides a durable queue in PostgreSQL alongside the
+pipeline state, while S3-compatible object storage holds activation audio and
+generated session artifacts.
 
 ## Packages
 
-| Package            | Description                                                           |
-| ------------------ | --------------------------------------------------------------------- |
-| `@rainbot/discord` | Discord bot — joins voice channels and records audio                  |
-| `@rainbot/storage` | S3-compatible object access and artifact validation                   |
-| `@rainbot/worker`  | Postgres worker — transcription, aggregation, inference, notification |
-| `@rainbot/db`      | Drizzle schema, PostgreSQL client, and durable processing state       |
-| `@rainbot/web`     | SvelteKit frontend                                                    |
+| Package            | Description                                                          |
+| ------------------ | -------------------------------------------------------------------- |
+| `@rainbot/discord` | Discord bot — joins voice channels and records audio                 |
+| `@rainbot/storage` | S3-compatible object access and artifact validation                  |
+| `@rainbot/worker`  | pg-boss worker — transcription, aggregation, inference, notification |
+| `@rainbot/db`      | Drizzle schema, pg-boss client, and durable processing state         |
+| `@rainbot/web`     | SvelteKit frontend                                                   |
 
 ## Requirements
 
@@ -69,21 +69,20 @@ Service names below match `docker-compose.yml`; `db-migrate` is the
 
 ### Audio and processing
 
-| Variable                           | Used by              | Description                                                                        |
-| ---------------------------------- | -------------------- | ---------------------------------------------------------------------------------- |
-| `S3_ACCESS_KEY_ID`                 | discord, worker, web | Optional static access key; omit both credentials to use the AWS provider chain    |
-| `S3_BUCKET_ARTIFACT`               | worker, web          | Private bucket for durable transcripts and detailed records                        |
-| `S3_BUCKET_AUDIO`                  | discord, worker, web | Private, short-lived activation-audio bucket; web uses it for manual uploads       |
-| `S3_ENDPOINT`                      | discord, worker, web | Optional shared S3-compatible endpoint; omit for AWS S3                            |
-| `S3_FORCE_PATH_STYLE`              | discord, worker, web | Set to `true` when the storage provider requires path-style requests               |
-| `S3_REGION`                        | discord, worker, web | Object-storage region                                                              |
-| `S3_SECRET_ACCESS_KEY`             | discord, worker, web | Optional static secret; must be set with the access key                            |
-| `TRANSCRIPTION_URL`                | worker               | Complete transcription endpoint, such as `http://whisper-server:8080/inference`    |
-| `TRANSCRIPTION_MODEL`              | worker               | Transcription model ID (default: `whisper-large-v3-turbo`)                         |
-| `TRANSCRIPTION_CONCURRENCY`        | worker               | Simultaneous activation transcriptions (default: `4`)                              |
-| `PROCESSING_CONCURRENCY`           | worker               | Sessions processed concurrently by one worker (default: `2`)                       |
-| `PROCESSING_POLL_MILLISECONDS`     | worker               | Delay between Postgres queue polls (default: `2000`)                               |
-| `PROCESSING_MAX_ATTEMPTS`          | worker               | Maximum attempts for a session or activation before failure (default: `3`)         |
+| Variable                    | Used by              | Description                                                                     |
+| --------------------------- | -------------------- | ------------------------------------------------------------------------------- |
+| `S3_ACCESS_KEY_ID`          | discord, worker, web | Optional static access key; omit both credentials to use the AWS provider chain |
+| `S3_BUCKET_ARTIFACT`        | worker, web          | Private bucket for durable transcripts and detailed records                     |
+| `S3_BUCKET_AUDIO`           | discord, worker, web | Private, short-lived activation-audio bucket; web uses it for manual uploads    |
+| `S3_ENDPOINT`               | discord, worker, web | Optional shared S3-compatible endpoint; omit for AWS S3                         |
+| `S3_FORCE_PATH_STYLE`       | discord, worker, web | Set to `true` when the storage provider requires path-style requests            |
+| `S3_REGION`                 | discord, worker, web | Object-storage region                                                           |
+| `S3_SECRET_ACCESS_KEY`      | discord, worker, web | Optional static secret; must be set with the access key                         |
+| `TRANSCRIPTION_URL`         | worker               | Complete transcription endpoint, such as `http://whisper-server:8080/inference` |
+| `TRANSCRIPTION_MODEL`       | worker               | Transcription model ID (default: `whisper-large-v3-turbo`)                      |
+| `TRANSCRIPTION_CONCURRENCY` | worker               | Simultaneous activation transcriptions (default: `4`)                           |
+| `PROCESSING_CONCURRENCY`    | worker               | Sessions processed concurrently by one worker (default: `2`)                    |
+| `PROCESSING_MAX_ATTEMPTS`   | worker               | Maximum attempts for a session or activation before failure (default: `3`)      |
 
 ### Language-model inference
 

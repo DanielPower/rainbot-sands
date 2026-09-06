@@ -2,6 +2,8 @@
   import { marked } from "marked";
   import type { ActionData, PageData } from "./$types";
   import { page } from "$app/state";
+  import { invalidateAll } from "$app/navigation";
+  import { onMount } from "svelte";
   import TaperedRule from "$lib/components/TaperedRule.svelte";
   import LibbyChat from "$lib/components/LibbyChat.svelte";
 
@@ -9,6 +11,17 @@
 
   type SessionTab = "recap" | "summary" | "transcript";
   type TranscriptTurn = NonNullable<PageData["transcriptTurns"]>[number];
+  type SessionStatus = PageData["session"]["status"];
+  interface LiveTranscriptSnippet extends TranscriptTurn {
+    id: string;
+  }
+
+  let streamedStatus = $state<SessionStatus | null>(null);
+  let liveTranscriptSnippets = $state<LiveTranscriptSnippet[]>([]);
+  let sessionStatus = $derived(streamedStatus ?? data.session.status);
+  let transcriptTurns = $derived(
+    data.transcriptTurns?.length ? data.transcriptTurns : liveTranscriptSnippets,
+  );
 
   function sessionTab(value: string | null): SessionTab {
     return value === "summary" || value === "transcript" ? value : "recap";
@@ -66,6 +79,37 @@
       event.preventDefault();
     }
   }
+
+  onMount(() => {
+    if (!data.canViewDetails || ["done", "failed"].includes(data.session.status)) return;
+
+    const source = new EventSource(
+      `/campaigns/${data.session.campaignId}/sessions/${data.session.id}/transcript/events`,
+    );
+    source.addEventListener("snippet", (event) => {
+      const snippet = JSON.parse((event as MessageEvent<string>).data) as LiveTranscriptSnippet;
+      liveTranscriptSnippets = [
+        ...liveTranscriptSnippets.filter((candidate) => candidate.id !== snippet.id),
+        snippet,
+      ].toSorted((a, b) => a.timestamp.localeCompare(b.timestamp));
+    });
+    source.addEventListener("status", (event) => {
+      const update = JSON.parse((event as MessageEvent<string>).data) as {
+        status: SessionStatus | null;
+      };
+      streamedStatus = update.status;
+    });
+    source.addEventListener("complete", (event) => {
+      const update = JSON.parse((event as MessageEvent<string>).data) as {
+        status: SessionStatus | null;
+      };
+      streamedStatus = update.status;
+      source.close();
+      if (update.status === "done") void invalidateAll();
+    });
+
+    return () => source.close();
+  });
 </script>
 
 <svelte:head>
@@ -87,13 +131,13 @@
     <p class="muted session-date">{formatDate(data.session.startedAt)}</p>
   {/if}
   <TaperedRule />
-  <p class="muted status">Status: {data.session.status}</p>
+  <p class="muted status">Status: {sessionStatus}</p>
 
   {#if data.canViewDetails}
     {#if form?.message}
       <p class="error" role="alert">{form.message}</p>
     {/if}
-    {#if page.url.searchParams.has("regenerating") || data.session.status === "summarizing"}
+    {#if page.url.searchParams.has("regenerating") || sessionStatus === "summarizing"}
       <p class="muted">Regeneration is running. Refresh this page to see its progress.</p>
     {/if}
     {#if page.url.searchParams.has("regeneratingTranscript")}
@@ -126,7 +170,7 @@
       </div>
     {/if}
 
-    {#if data.session.status === "done"}
+    {#if sessionStatus === "done"}
       <LibbyChat
         sessionId={data.session.id}
         campaignId={data.session.campaignId}
@@ -175,8 +219,8 @@
     </div>
 
     <div role="tabpanel" hidden={activeTab !== "transcript"}>
-      {#if data.transcriptTurns?.length}
-        {@const speakers = transcriptSpeakers(data.transcriptTurns)}
+      {#if transcriptTurns.length}
+        {@const speakers = transcriptSpeakers(transcriptTurns)}
         <section class="transcript-view" aria-label="Session transcript">
           <header class="transcript-header">
             <div>
@@ -187,7 +231,7 @@
               </p>
             </div>
             <div class="transcript-stats" aria-label="Transcript statistics">
-              <span>{data.transcriptTurns.length} speaker turns</span>
+              <span>{transcriptTurns.length} speaker turns</span>
               <span>{speakers.length} voices</span>
             </div>
           </header>
@@ -205,7 +249,7 @@
           </div>
 
           <ol class="transcript-list">
-            {#each data.transcriptTurns as turn, index (`${turn.timestamp}-${turn.userId}-${index}`)}
+            {#each transcriptTurns as turn, index (`${turn.timestamp}-${turn.userId}-${index}`)}
               <li class="transcript-turn" style={`--speaker-hue: ${speakerHue(turn.userId)}`}>
                 <div class="speaker-avatar" aria-hidden="true">
                   {speakerInitial(turn.speaker)}
@@ -227,7 +271,11 @@
           </ol>
         </section>
       {:else}
-        <p class="empty">Not yet available.</p>
+        <p class="empty">
+          {sessionStatus === "recording" || sessionStatus === "closing" || sessionStatus === "transcribing"
+            ? "Listening for transcription snippets…"
+            : "Not yet available."}
+        </p>
       {/if}
     </div>
   {:else}

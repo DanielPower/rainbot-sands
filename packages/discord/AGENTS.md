@@ -34,11 +34,13 @@ management commands use `commands/guard.ts` (`requireDmOfCampaign`).
   find the caller's channel and resolve usernames).
 - Each voice activation is registered in Postgres before recording, becomes one
   ogg/opus clip via **ffmpeg**, and is uploaded to S3-compatible object storage.
-- Activations are not transcribed live. Closing a session makes its durable
-  processing run claimable by the Postgres worker.
+- Marking an upload ready enqueues its pg-boss transcription job in the same
+  transaction, so the worker can transcribe while the session is still active.
 - Session shutdown first stops new activations, then finalizes all active
-  receiver/decoder/ffmpeg pipelines before closing the durable session. Keep
-  this ordering so speech in progress during `/stop` or auto-end is retained.
+  receiver/decoder/ffmpeg pipelines before closing the durable session. The
+  close transition and transcription barrier then enqueue post-session work
+  when every activation is terminal. Keep this ordering so speech in progress
+  during `/stop` or auto-end is retained.
 - The transcript speaker label is the **account username** resolved from the
   guild member cache (`session.ts`), falling back to the user id. It is joined to
   campaign members by `userId` downstream, so keep the id flowing through.

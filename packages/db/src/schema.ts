@@ -127,16 +127,11 @@ export const processingRuns = pgTable(
     notificationChannelId: varchar("notification_channel_id", { length: 20 }),
     notificationStatus: varchar("notification_status", { length: 20 }).$type<NotificationStatus>(),
     error: text("error"),
-    availableAt: timestamp("available_at").defaultNow().notNull(),
-    lockedBy: text("locked_by"),
-    leaseExpiresAt: timestamp("lease_expires_at"),
-    attemptCount: integer("attempt_count").default(0).notNull(),
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
     finishedAt: timestamp("finished_at"),
   },
   (t) => [
-    index("processing_runs_queue_idx").on(t.status, t.availableAt, t.leaseExpiresAt),
     index("processing_runs_status_idx").on(t.status),
     index("processing_runs_session_idx").on(t.sessionId),
     check("processing_runs_kind_check", oneOf(t.kind, PROCESSING_RUN_KINDS)),
@@ -205,7 +200,9 @@ export const sessionSegments = pgTable(
     transcriptionStatus: varchar("transcription_status", {
       length: 20,
     }).$type<TranscriptionStatus>(),
+    transcriptionJobId: uuid("transcription_job_id"),
     transcript: jsonb("transcript").$type<TranscriptSegment>(),
+    transcribedAt: timestamp("transcribed_at"),
     error: text("error"),
     createdAt: timestamp("created_at").defaultNow().notNull(),
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
@@ -213,6 +210,7 @@ export const sessionSegments = pgTable(
   (t) => [
     primaryKey({ columns: [t.sessionId, t.segmentId] }),
     index("session_segments_run_status_idx").on(t.transcriptionRunId, t.transcriptionStatus),
+    index("session_segments_live_transcript_idx").on(t.sessionId, t.transcribedAt),
     index("session_segments_session_audio_idx").on(t.sessionId, t.audioStatus),
     check("session_segments_audio_status_check", oneOf(t.audioStatus, AUDIO_STATUSES)),
     check(
